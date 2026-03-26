@@ -27,6 +27,7 @@ class Radish:
         backend_url: str,
         default_queue: str = "default",
         result_expire_seconds: Optional[int] = None,
+        dlq_max_length: Optional[int] = None,
     ):
         """
         Create the core Radish application object.
@@ -49,7 +50,7 @@ class Radish:
         self.default_queue = default_queue
 
         # Create the broker used for task delivery.
-        self.broker = RedisBroker(broker_url)
+        self.broker = RedisBroker(broker_url,dlq_max_length)
 
         # Create the backend used for state and result storage.
         self.backend = RedisBackend(

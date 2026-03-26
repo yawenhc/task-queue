@@ -4,10 +4,11 @@ from typing import Optional, Tuple, List
 
 from redis import Redis
 
-from radish.models import TaskMessage
+from radish.broker.broker import Broker  # CHANGED: inherit from Broker
+from radish.models import TaskMessage, DLQMessage
 
 
-class RedisBroker:
+class RedisBroker(Broker):  # CHANGED: inherit from Broker
     """
     Redis-backed broker for task delivery and crash recovery.
 
@@ -16,9 +17,12 @@ class RedisBroker:
 
     Reserved but not yet acknowledged tasks are stored in:
         radish:processing:{queue_name}
+
+    Dead-lettered tasks are stored in:
+        radish:dlq:{queue_name}
     """
 
-    def __init__(self, redis_url: str):
+    def __init__(self, redis_url: str, dlq_max_length: int = 100):
         """
         Create a Redis client from a connection URL.
 
@@ -26,6 +30,7 @@ class RedisBroker:
             redis://localhost:6379/0
         """
         self.redis = Redis.from_url(redis_url, decode_responses=True)
+        self.dlq_max_length = dlq_max_length  # CHANGED
 
     def _queue_key(self, queue: str) -> str:
         """
@@ -38,6 +43,41 @@ class RedisBroker:
         Return the Redis key for the processing queue.
         """
         return f"radish:processing:{queue}"
+
+    def _dlq_key(self, queue: str) -> str:
+        """
+        Return the Redis key for the dead-letter queue.
+        """
+        return f"radish:dlq:{queue}"
+
+    def _trim_dlq_if_needed(self, queue: str) -> None:
+        """
+        Keep only the newest dlq_max_length items in the DLQ list.
+        """
+        dlq_key = self._dlq_key(queue)
+        self.redis.ltrim(dlq_key, 0, self.dlq_max_length - 1)
+
+    def _dlq_to_task_message(self, dlq_message: DLQMessage) -> TaskMessage:
+        """
+        Convert a DLQ message back into a normal task message for requeue.
+
+        Requeue rules:
+            - keep the same task id
+            - reset attempt to 1
+            - reset reserved_at to None
+        """
+        return {
+            "id": dlq_message["id"],
+            "task_name": dlq_message["task_name"],
+            "args": dlq_message["args"],
+            "kwargs": dlq_message["kwargs"],
+            "queue": dlq_message["queue"],
+            "created_at": dlq_message["created_at"],
+            "reserved_at": None,  # CHANGED: reset for requeue
+            "attempt": 1,  # CHANGED: reset attempt for requeue
+            "max_retries": dlq_message["max_retries"],
+            "retry_delay_ms": dlq_message["retry_delay_ms"],
+        }
 
     def enqueue(self, message: TaskMessage) -> None:
         """
@@ -72,7 +112,7 @@ class RedisBroker:
 
         message: TaskMessage = json.loads(raw_message)
         message["reserved_at"] = time.time()
-        #update reserved time
+        # update reserved time
         updated_raw_message = json.dumps(message)
 
         self.redis.lrem(processing_key, 1, raw_message)
@@ -143,3 +183,84 @@ class RedisBroker:
                     moved_count += 1
 
         return moved_count
+
+    def push_to_dlq(self, message: DLQMessage) -> None:
+        """
+        Push a dead-lettered task into the DLQ.
+
+        The newest message is pushed to the head of the list.
+        If the DLQ exceeds dlq_max_length, the oldest messages are trimmed.
+        """
+        dlq_key = self._dlq_key(message["queue"])
+        self.redis.lpush(dlq_key, json.dumps(message))
+        self._trim_dlq_if_needed(message["queue"])
+
+
+    def list_dlq(self, queue: str, limit: int = 100) -> List[DLQMessage]:
+        """
+        Return the newest DLQ messages for a queue.
+
+        The returned list is ordered from newest to oldest.
+        """
+        dlq_key = self._dlq_key(queue)
+        raw_messages = self.redis.lrange(dlq_key, 0, limit - 1)
+        return [json.loads(raw_message) for raw_message in raw_messages]
+
+
+    def delete_dlq_task(self, queue: str, task_id: str) -> bool:
+        """
+        Delete one DLQ task by task_id.
+
+        Returns:
+            True if one matching message was removed.
+            False if no matching task_id was found.
+        """
+        dlq_key = self._dlq_key(queue)
+        raw_messages = self.redis.lrange(dlq_key, 0, -1)
+
+        for raw_message in raw_messages:
+            message: DLQMessage = json.loads(raw_message)
+            if message["id"] == task_id:
+                removed = self.redis.lrem(dlq_key, 1, raw_message)
+                return removed > 0
+
+        return False
+
+
+    def requeue_dlq_task(self, queue: str, task_id: str) -> Optional[TaskMessage]:
+        """
+        Requeue one DLQ task back to the ready queue.
+
+            1. Find the DLQ message by task_id
+            2. Convert it to TaskMessage
+            3. Push it back to the ready queue
+            4. Remove it from the DLQ
+            5. Return the requeued TaskMessage
+
+        Returns:
+            The requeued TaskMessage if found and moved successfully.
+            None if no matching task_id was found.
+        """
+        dlq_key = self._dlq_key(queue)
+        ready_key = self._queue_key(queue)
+        raw_messages = self.redis.lrange(dlq_key, 0, -1)
+
+        for raw_message in raw_messages:
+            message: DLQMessage = json.loads(raw_message)
+            if message["id"] != task_id:
+                continue
+
+            task_message = self._dlq_to_task_message(message)
+
+            pipeline = self.redis.pipeline()
+            pipeline.lpush(ready_key, json.dumps(task_message))
+            pipeline.lrem(dlq_key, 1, raw_message)
+            results = pipeline.execute()
+
+            removed_count = results[1]
+            if removed_count > 0:
+                return task_message
+
+            return task_message
+
+        return None

@@ -1,0 +1,374 @@
+import json
+import multiprocessing
+import signal
+import time
+from dataclasses import dataclass
+from typing import Dict, Optional, List, Tuple
+
+from radish.logger import create_supervisor_logger
+from radish.models import ActiveTaskRecord, TaskMessage, DLQMessage
+from radish.worker.child_runner import run_worker_process, load_app
+from radish.worker.redis_worker_tracking import RedisWorkerTracking
+
+
+@dataclass
+class WorkerSlot:
+    slot_id: int
+    worker_id: str
+    process: multiprocessing.Process
+    started_at: float
+
+
+class WorkerSupervisor:
+    def __init__(
+        self,
+        app_path: str,
+        queue: str,
+        worker_count: int,
+        poll_timeout: int,
+        visibility_timeout: int,
+        project_name: str,
+        run_id: str,
+        monitor_interval: float = 1.0,
+        restart_window_seconds: int = 300, #300
+        max_crashes_in_window: int = 3,
+        worker_tracking_redis_url: Optional[str] = None,
+    ) -> None:
+        self.app_path = app_path
+        self.queue = queue
+        self.worker_count = worker_count
+        self.poll_timeout = poll_timeout
+        self.visibility_timeout = visibility_timeout
+        self.project_name = project_name
+        self.run_id = run_id
+        self.monitor_interval = monitor_interval
+
+        # crash loop protection config
+        self.restart_window_seconds = restart_window_seconds
+        self.max_crashes_in_window = max_crashes_in_window
+
+        self.running = False
+        self.shutting_down = False
+        self.workers: Dict[int, WorkerSlot] = {}
+
+        # track recent crash timestamps by slot
+        self.crash_history: Dict[int, List[float]] = {}
+        self.disabled_slots: set[int] = set()
+
+        self.logger = create_supervisor_logger(
+            project_name=self.project_name,
+            run_id=self.run_id,
+        )
+
+        # load app in supervisor for broker/backend access
+        self.app = load_app(self.app_path)
+
+        # infer worker tracking redis url if not provided
+        self.worker_tracking_redis_url = (
+            worker_tracking_redis_url or self._infer_redis_url_from_broker()
+        )
+
+        # create worker tracking client for supervisor side lookup
+        self.tracking = RedisWorkerTracking(self.worker_tracking_redis_url)
+
+    def _log(self, event: str) -> None:
+        self.logger.info(event)
+
+    def _build_worker_id(self, slot_id: int) -> str:
+        return f"worker-{slot_id}"
+
+    # infer redis url from app broker connection settings
+    def _infer_redis_url_from_broker(self) -> str:
+        """
+        Build a Redis URL from the broker client's connection settings.
+
+        This allows worker tracking to reuse the same Redis instance
+        without requiring an extra explicit URL in the common case.
+        """
+        connection_kwargs = self.app.broker.redis.connection_pool.connection_kwargs
+
+        host = connection_kwargs.get("host", "localhost")
+        port = connection_kwargs.get("port", 6379)
+        db = connection_kwargs.get("db", 0)
+        username = connection_kwargs.get("username")
+        password = connection_kwargs.get("password")
+
+        auth_part = ""
+        if username is not None and password is not None:
+            auth_part = f"{username}:{password}@"
+        elif password is not None:
+            auth_part = f":{password}@"
+        elif username is not None:
+            auth_part = f"{username}@"
+
+        return f"redis://{auth_part}{host}:{port}/{db}"
+
+    # keep only crash timestamps within the configured window
+    def _prune_crash_history(self, slot_id: int, now: float) -> None:
+        history = self.crash_history.get(slot_id, [])
+        self.crash_history[slot_id] = [
+            ts for ts in history if now - ts <= self.restart_window_seconds
+        ]
+
+    # record one crash event and return current crash count in window
+    def _record_crash(self, slot_id: int) -> int:
+        now = time.time()
+        self._prune_crash_history(slot_id, now)
+
+        history = self.crash_history.get(slot_id, [])
+        history.append(now)
+        self.crash_history[slot_id] = history
+
+        return len(history)
+
+    # determine whether a slot has entered crash loop
+    def _is_crash_loop(self, slot_id: int) -> bool:
+        history = self.crash_history.get(slot_id, [])
+        return len(history) >= self.max_crashes_in_window
+
+    # find the currently reserved task message in processing queue by task_id
+    def _find_processing_message(self, task_id: str) -> Optional[Tuple[str, TaskMessage]]:
+        processing_key = self.app.broker._processing_key(self.queue)
+        raw_messages = self.app.broker.redis.lrange(processing_key, 0, -1)
+
+        for raw_message in raw_messages:
+            message: TaskMessage = json.loads(raw_message)
+            if message["id"] == task_id:
+                return raw_message, message
+
+        return None
+
+    # build DLQ message for worker crash loop
+    def _build_dead_letter_message(self, message: TaskMessage) -> DLQMessage:
+        return {
+            "id": message["id"],
+            "task_name": message["task_name"],
+            "args": message["args"],
+            "kwargs": message["kwargs"],
+            "queue": message["queue"],
+            "created_at": message["created_at"],
+            "attempt": message["attempt"],
+            "max_retries": message["max_retries"],
+            "retry_delay_ms": message["retry_delay_ms"],
+            "dead_letter_reason": "worker_crash_loop",
+            "failure_type": "worker_crash",
+            "dead_lettered_at": time.time(),
+        }
+
+    # move the active task to DLQ when a slot enters crash loop
+    def _dead_letter_active_task_for_crash_loop(
+        self,
+        slot_id: int,
+        worker_id: str,
+        exitcode: int,
+    ) -> None:
+        active_record = self.tracking.get_active(worker_id, slot_id)
+        if active_record is None:
+            self._log(
+                f"worker_crash_loop_no_active_task slot={slot_id} "
+                f"worker_id={worker_id} exitcode={exitcode}"
+            )
+            return
+
+        found = self._find_processing_message(active_record.task_id)
+        if found is None:
+            self._log(
+                f"worker_crash_loop_processing_message_missing slot={slot_id} "
+                f"worker_id={worker_id} task_id={active_record.task_id} "
+                f"exitcode={exitcode}"
+            )
+            self.tracking.clear_active(worker_id, slot_id)
+            return
+
+        raw_message, message = found
+        dlq_message = self._build_dead_letter_message(message)
+
+        self.app.broker.push_to_dlq(dlq_message)
+        self.app.backend.set_dead_lettered(
+            task_id=message["id"],
+            attempt=message["attempt"],
+            max_retries=message["max_retries"],
+            error=f"worker exited unexpectedly with exitcode={exitcode}",
+            dead_letter_reason="worker_crash_loop",
+            started_at=active_record.started_at,
+        )
+        self.app.broker.ack(self.queue, raw_message)
+        self.tracking.clear_active(worker_id, slot_id)
+
+        self._log(
+            f"task_dead_lettered_for_worker_crash_loop slot={slot_id} "
+            f"worker_id={worker_id} task_id={message['id']} "
+            f"task_name={message['task_name']} exitcode={exitcode}"
+        )
+
+    def _spawn_worker(self, slot_id: int) -> WorkerSlot:
+        worker_id = self._build_worker_id(slot_id)
+
+        process = multiprocessing.Process(
+            target=run_worker_process,
+            kwargs={
+                "app_path": self.app_path,
+                "queue": self.queue,
+                "poll_timeout": self.poll_timeout,
+                "visibility_timeout": self.visibility_timeout,
+                "worker_id": worker_id,
+                "project_name": self.project_name,
+                "run_id": self.run_id,
+                "slot": slot_id,
+                "worker_tracking_redis_url": self.worker_tracking_redis_url,
+            },
+            name=worker_id,
+        )
+        process.start()
+
+        slot = WorkerSlot(
+            slot_id=slot_id,
+            worker_id=worker_id,
+            process=process,
+            started_at=time.time(),
+        )
+
+        self._log(
+            f"worker_spawned slot={slot_id} "
+            f"worker_id={worker_id} pid={process.pid}"
+        )
+        return slot
+
+    def _start_initial_workers(self) -> None:
+        for slot_id in range(1, self.worker_count + 1):
+            if slot_id in self.disabled_slots:
+                continue
+            slot = self._spawn_worker(slot_id)
+            self.workers[slot_id] = slot
+
+    def _restart_worker(self, slot_id: int) -> None:
+        # do not restart disabled slots
+        if slot_id in self.disabled_slots:
+            self._log(f"worker_restart_skipped slot={slot_id} reason=slot_disabled")
+            return
+
+        old_slot = self.workers.get(slot_id)
+
+        if old_slot:
+            self._log(
+                f"worker_restarting slot={slot_id} "
+                f"old_pid={old_slot.process.pid} "
+                f"exitcode={old_slot.process.exitcode}"
+            )
+
+        new_slot = self._spawn_worker(slot_id)
+        self.workers[slot_id] = new_slot
+
+    def _handle_exited_worker(self, slot_id: int, slot: WorkerSlot) -> None:
+        process = slot.process
+        exitcode = process.exitcode
+
+        if exitcode is None:
+            return
+
+        if self.shutting_down:
+            self._log(
+                f"worker_exited_during_shutdown slot={slot_id} "
+                f"worker_id={slot.worker_id} pid={process.pid} "
+                f"exitcode={exitcode}"
+            )
+            return
+
+        if exitcode == 0:
+            self._log(
+                f"worker_exited slot={slot_id} "
+                f"worker_id={slot.worker_id} pid={process.pid} exitcode=0"
+            )
+            self._restart_worker(slot_id)
+            return
+
+        self._log(
+            f"worker_crashed slot={slot_id} "
+            f"worker_id={slot.worker_id} pid={process.pid} exitcode={exitcode}"
+        )
+
+        # record crash and evaluate crash loop protection
+        crash_count = self._record_crash(slot_id)
+        if self._is_crash_loop(slot_id):
+            self._log(
+                f"worker_crash_loop_detected slot={slot_id} "
+                f"worker_id={slot.worker_id} crash_count={crash_count} "
+                f"window_seconds={self.restart_window_seconds}"
+            )
+
+            self._dead_letter_active_task_for_crash_loop(
+                slot_id=slot_id,
+                worker_id=slot.worker_id,
+                exitcode=exitcode,
+            )
+
+            self.disabled_slots.add(slot_id)
+            self.workers.pop(slot_id, None)
+            self._log(
+                f"worker_slot_disabled slot={slot_id} "
+                f"worker_id={slot.worker_id} reason=worker_crash_loop"
+            )
+            return
+
+        self._restart_worker(slot_id)
+
+    def _check_workers(self) -> None:
+        for slot_id, slot in list(self.workers.items()):
+            if slot_id in self.disabled_slots:
+                continue
+            process = slot.process
+
+            if process.is_alive():
+                continue
+
+            process.join(timeout=0.1)
+            self._handle_exited_worker(slot_id, slot)
+
+    def _terminate_worker(self, slot: WorkerSlot, timeout: float = 5.0) -> None:
+        process = slot.process
+
+        if not process.is_alive():
+            process.join(timeout=0.1)
+            return
+
+        process.terminate()
+        process.join(timeout=timeout)
+
+    def _shutdown_all_workers(self) -> None:
+        self.shutting_down = True
+        self._log("supervisor_shutdown_started")
+
+        for slot in list(self.workers.values()):
+            self._terminate_worker(slot)
+
+        self._log("supervisor_shutdown_finished")
+
+    def _handle_signal(self, signum: int, frame: Optional[object]) -> None:
+        self._log(f"signal_received signal={signum}")
+        self.running = False
+
+    def start(self) -> None:
+        self.running = True
+
+        signal.signal(signal.SIGINT, self._handle_signal)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, self._handle_signal)
+
+        self._log(
+            f"supervisor_started app={self.app_path} "
+            f"queue={self.queue} workers={self.worker_count} "
+            f"restart_window_seconds={self.restart_window_seconds} "
+            f"max_crashes_in_window={self.max_crashes_in_window}"  # CHANGED
+        )
+
+        self._start_initial_workers()
+
+        try:
+            while self.running:
+                self._check_workers()
+                time.sleep(self.monitor_interval)
+        except KeyboardInterrupt:
+            self._log("keyboard_interrupt")
+            self.running = False
+        finally:
+            self._shutdown_all_workers()
