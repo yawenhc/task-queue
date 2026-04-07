@@ -4,7 +4,7 @@ from datetime import datetime
 
 from radish.worker.supervisor import WorkerSupervisor
 from radish.worker.child_runner import run_worker_process
-
+from radish.monitor.app import run_monitor_server
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="radish")
@@ -47,6 +47,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Project name used in log file naming",
     )
 
+    # Added monitor subcommand
+    monitor_parser = subparsers.add_parser("monitor", help="Start Radish monitor")
+    monitor_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host address for the monitor server",
+    )
+    monitor_parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="Port for the monitor server",
+    )
+    monitor_parser.add_argument(
+        "--queue",
+        default="default",
+        help="Queue name to inspect",
+    )
+
     return parser
 
 
@@ -87,6 +106,15 @@ def main() -> None:
             run_id=run_id,
         )
         supervisor.start()
+        return
+
+    if args.command == "monitor":
+        run_monitor_server(
+            app_path=args.app,
+            queue=args.queue,
+            host=args.host,
+            port=args.port,
+        )
         return
 
     parser.print_help()

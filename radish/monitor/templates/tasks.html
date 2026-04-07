@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block content %}
+    <h2>Tasks</h2>
+
+    <div class="card-row">
+        <div class="card">
+            <div class="card-title">Total Tasks</div>
+            <div class="card-value">{{ data.total_tasks }}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Ready Queue</div>
+            <div class="card-value">{{ data.ready_queue_length }}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Processing Queue</div>
+            <div class="card-value">{{ data.processing_queue_length }}</div>
+        </div>
+    </div>
+
+    <h2>Task States</h2>
+    <div class="card-row">
+        {% for state, count in data.state_counts.items() %}
+        <div class="card">
+            <div class="card-title">{{ state }}</div>
+            <div class="card-value">{{ count }}</div>
+        </div>
+        {% endfor %}
+    </div>
+
+    <h2>Recent Tasks</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Task ID</th>
+                <th>Task Name</th>
+                <th>State</th>
+                <th>Attempt</th>
+                <th>Max Retries</th>
+                <th>Created At</th>
+                <th>Started At</th>
+                <th>Finished At</th>
+                <th>Worker ID</th>
+                <th>Error</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for task in data.recent_tasks %}
+            <tr>
+                <td>{{ task.task_id }}</td>
+                <td>{{ task.task_name or "-" }}</td>
+                <td><span class="state-pill">{{ task.state }}</span></td>
+                <td>{{ task.attempt if task.attempt is not none else "-" }}</td>
+                <td>{{ task.max_retries if task.max_retries is not none else "-" }}</td>
+                <td>{{ task.created_at or "-" }}</td>
+                <td>{{ task.started_at or "-" }}</td>
+                <td>{{ task.finished_at or "-" }}</td>
+                <td>{{ task.worker_id or "-" }}</td>
+                <td>{{ task.error or "-" }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+{% endblock %}

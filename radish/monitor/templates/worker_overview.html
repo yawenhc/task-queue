@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+
+{% block content %}
+    <h2>Worker Overview</h2>
+
+    <div class="card-row">
+        <div class="card">
+            <div class="card-title">Total Workers</div>
+            <div class="card-value">{{ data.total_workers }}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Busy</div>
+            <div class="card-value">{{ data.busy_workers }}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Idle</div>
+            <div class="card-value">{{ data.idle_workers }}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Offline</div>
+            <div class="card-value">{{ data.offline_workers }}</div>
+        </div>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Worker ID</th>
+                <th>Status</th>
+                <th>Current Task ID</th>
+                <th>Current Task Name</th>
+                <th>Last Heartbeat</th>
+                <th>Seconds Since Heartbeat</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for worker in data.workers %}
+            <tr>
+                <td>{{ worker.worker_id }}</td>
+                <td class="status-{{ worker.status }}">{{ worker.status }}</td>
+                <td>{{ worker.current_task_id or "-" }}</td>
+                <td>{{ worker.current_task_name or "-" }}</td>
+                <td>{{ worker.last_heartbeat_at or "-" }}</td>
+                <td>{{ worker.seconds_since_heartbeat if worker.seconds_since_heartbeat is not none else "-" }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+{% endblock %}

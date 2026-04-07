@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+
+{% block content %}
+    <h2>Workers</h2>
+    <p>Queue: <strong>{{ data.queue }}</strong></p>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Worker ID</th>
+                <th>Status</th>
+                <th>Current Task ID</th>
+                <th>Current Task Name</th>
+                <th>Attempt</th>
+                <th>Queue</th>
+                <th>Started At</th>
+                <th>Last Heartbeat</th>
+                <th>Seconds Since Heartbeat</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for worker in data.workers %}
+            <tr>
+                <td>{{ worker.worker_id }}</td>
+                <td class="status-{{ worker.status }}">{{ worker.status }}</td>
+                <td>{{ worker.current_task_id or "-" }}</td>
+                <td>{{ worker.current_task_name or "-" }}</td>
+                <td>{{ worker.attempt if worker.attempt is not none else "-" }}</td>
+                <td>{{ worker.queue or "-" }}</td>
+                <td>{{ worker.started_at or "-" }}</td>
+                <td>{{ worker.last_heartbeat_at or "-" }}</td>
+                <td>{{ worker.seconds_since_heartbeat if worker.seconds_since_heartbeat is not none else "-" }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+{% endblock %}
