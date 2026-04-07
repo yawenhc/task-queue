@@ -1,8 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
-from radish.models import ActiveTaskRecord
-
+from radish.models import ActiveTaskRecord, WorkerHeartbeatRecord
 
 class WorkerTracking(ABC):
     """
@@ -56,5 +55,41 @@ class WorkerTracking(ABC):
         This is typically used by:
         - monitor
         - supervisor (optional)
+        """
+        pass
+
+    @abstractmethod
+    def set_heartbeat(self, record: WorkerHeartbeatRecord) -> None:
+        """
+        Update heartbeat for a worker slot.
+
+        This should be called periodically by the worker process.
+        """
+        pass
+
+    @abstractmethod
+    def clear_heartbeat(self, worker_id: str, slot: int) -> None:
+        """
+        Remove heartbeat record for a worker slot.
+
+        This should be called when worker exits.
+        """
+        pass
+
+    @abstractmethod
+    def get_heartbeat(self, worker_id: str, slot: int) -> Optional[WorkerHeartbeatRecord]:
+        """
+        Retrieve heartbeat for a specific worker slot.
+
+        Returns None if no heartbeat exists.
+        """
+        pass
+
+    @abstractmethod
+    def list_all_heartbeats(self) -> List[WorkerHeartbeatRecord]:
+        """
+        Retrieve all heartbeat records.
+
+        This is typically used by supervisor to detect offline workers.
         """
         pass

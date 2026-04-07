@@ -69,3 +69,9 @@ class ActiveTaskRecord:
     attempt: int
     max_retries: int
     started_at: int  # timestamp
+
+class WorkerHeartbeatRecord:
+    worker_id: str
+    slot: int
+    queue: str
+    last_heartbeat_at: float

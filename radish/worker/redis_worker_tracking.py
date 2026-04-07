@@ -6,6 +6,8 @@ import redis
 
 from radish.models import ActiveTaskRecord
 from radish.worker.worker_tracking import WorkerTracking
+from radish.models import WorkerHeartbeatRecord
+
 
 
 class RedisWorkerTracking(WorkerTracking):
@@ -29,12 +31,16 @@ class RedisWorkerTracking(WorkerTracking):
 
         # Key prefix for active task records
         self.prefix = "radish:worker:active"
+        self.heartbeat_prefix = "radish:worker:heartbeat"
 
     def _key(self, worker_id: str, slot: int) -> str:
         """
         Build Redis key for a worker slot.
         """
         return f"{self.prefix}:{worker_id}:{slot}"
+
+    def _heartbeat_key(self, worker_id: str, slot: int) -> str:
+        return f"{self.heartbeat_prefix}:{worker_id}:{slot}"
 
     def set_active(self, record: ActiveTaskRecord) -> None:
         """
@@ -119,6 +125,73 @@ class RedisWorkerTracking(WorkerTracking):
             record.attempt = data["attempt"]
             record.max_retries = data["max_retries"]
             record.started_at = data["started_at"]
+
+            records.append(record)
+
+        return records
+
+    def set_heartbeat(self, record: WorkerHeartbeatRecord) -> None:
+        """
+        Store heartbeat for a worker slot.
+        """
+        key = self._heartbeat_key(record.worker_id, record.slot)
+
+        value = json.dumps({
+            "worker_id": record.worker_id,
+            "slot": record.slot,
+            "queue": record.queue,
+            "last_heartbeat_at": record.last_heartbeat_at,
+        })
+
+        self.client.set(key, value)
+
+    def clear_heartbeat(self, worker_id: str, slot: int) -> None:
+        """
+        Remove heartbeat record for a worker slot.
+        """
+        key = self._heartbeat_key(worker_id, slot)
+        self.client.delete(key)
+
+    def get_heartbeat(self, worker_id: str, slot: int) -> Optional[WorkerHeartbeatRecord]:
+        """
+        Retrieve heartbeat for a worker slot.
+        """
+        key = self._heartbeat_key(worker_id, slot)
+        value = self.client.get(key)
+
+        if not value:
+            return None
+
+        data = json.loads(value)
+
+        record = WorkerHeartbeatRecord()
+        record.worker_id = data["worker_id"]
+        record.slot = data["slot"]
+        record.queue = data["queue"]
+        record.last_heartbeat_at = data["last_heartbeat_at"]
+
+        return record
+
+    def list_all_heartbeats(self) -> List[WorkerHeartbeatRecord]:
+        """
+        Retrieve all heartbeat records.
+        """
+        pattern = f"{self.heartbeat_prefix}:*"
+
+        records: List[WorkerHeartbeatRecord] = []
+
+        for key in self.client.scan_iter(pattern):
+            value = self.client.get(key)
+            if not value:
+                continue
+
+            data = json.loads(value)
+
+            record = WorkerHeartbeatRecord()
+            record.worker_id = data["worker_id"]
+            record.slot = data["slot"]
+            record.queue = data["queue"]
+            record.last_heartbeat_at = data["last_heartbeat_at"]
 
             records.append(record)
 

@@ -1,26 +1,16 @@
-"""
-This module defines the Worker class.
-
-Responsibilities:
-1. Recover stale reserved tasks
-2. Reserve new tasks from the broker
-3. Execute registered task functions
-4. Update task state in the backend
-5. Retry failed tasks when allowed
-6. Acknowledge final task completion
-7. Expose a readable worker identity for logging and CLI usage
-"""
-
 import logging
 import socket
+import threading
 import time
 import uuid
+import os
 from typing import Callable, Dict, Any, Optional
 
 from radish.backend.redis_backend import RedisBackend
 from radish.broker.redis_broker import RedisBroker
-from radish.models import TaskMessage, DLQMessage, ActiveTaskRecord  # CHANGED
-from radish.worker.worker_tracking import WorkerTracking  # CHANGED
+from radish.models import TaskMessage, DLQMessage, ActiveTaskRecord
+from radish.models import WorkerHeartbeatRecord
+from radish.worker.worker_tracking import WorkerTracking
 
 
 class Worker:
@@ -38,46 +28,9 @@ class Worker:
         visibility_timeout: int = 10,
         worker_id: Optional[str] = None,
         logger: Optional[logging.Logger] = None,
-        tracking: Optional[WorkerTracking] = None,  # CHANGED
-        slot: int = 0,  # CHANGED
+        tracking: Optional[WorkerTracking] = None,
+        slot: int = 0,
     ):
-        """
-        Initialize a worker instance.
-
-        Args:
-            broker:
-                The broker used for task delivery and crash recovery.
-
-            backend:
-                The backend used for task state and result storage.
-
-            registry:
-                Maps task_name to the actual Python callable.
-
-            queue:
-                The queue this worker listens to.
-
-            poll_timeout:
-                The blocking wait time for reserve().
-
-            visibility_timeout:
-                If a reserved task is not acknowledged within this time,
-                it is considered stale and can be requeued.
-
-            worker_id:
-                Optional explicit worker identifier.
-                If not provided, a readable default ID is generated.
-
-            logger:
-                Optional logger injected by child_runner.
-                If not provided, falls back to stdout printing.
-
-            tracking:
-                Optional worker active task tracking implementation.
-
-            slot:
-                Optional worker slot index used by supervisor and tracking.
-        """
         self.broker = broker
         self.backend = backend
         self.registry = registry
@@ -87,33 +40,88 @@ class Worker:
         self.running = False
         self.worker_id = worker_id or self._generate_worker_id()
         self.logger = logger
-        self.tracking = tracking  # CHANGED
-        self.slot = slot  # CHANGED
+        self.tracking = tracking
+        self.slot = slot
+
+        # heartbeat interval is fixed for now
+        self.heartbeat_interval = 2
+
+        # background heartbeat thread state
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._heartbeat_stop_event = threading.Event()
 
     @staticmethod
     def _generate_worker_id() -> str:
-        """
-        Generate a readable default worker ID.
-
-        Format:
-            worker@hostname-xxxxxxxx
-        """
         hostname = socket.gethostname()
         short_uuid = str(uuid.uuid4())[:8]
         return f"worker@{hostname}-{short_uuid}"
 
     def _log(self, event: str) -> None:
-        """
-        Log one worker event.
-
-        Default behavior:
-            - use injected logger if available
-            - otherwise print to stdout
-        """
         if self.logger is not None:
             self.logger.info(event)
         else:
             print(f"[Worker {self.worker_id}] {event}")
+
+    def _send_heartbeat(self) -> None:
+        """
+        Send one heartbeat update.
+        """
+        if self.tracking is None:
+            return
+
+        record = WorkerHeartbeatRecord()
+        record.worker_id = self.worker_id
+        record.slot = self.slot
+        record.queue = self.queue
+        record.last_heartbeat_at = time.time()
+
+        self.tracking.set_heartbeat(record)
+
+    # heartbeat loop runs independently from task execution
+    def _heartbeat_loop(self) -> None:
+        """
+        Periodically send worker heartbeat in a background thread.
+        """
+        while not self._heartbeat_stop_event.is_set():
+            try:
+                self._send_heartbeat()
+            except Exception as exc:
+                self._log(
+                    f"heartbeat_error worker_id={self.worker_id} "
+                    f"error_type={type(exc).__name__} error={exc}"
+                )
+
+            self._heartbeat_stop_event.wait(self.heartbeat_interval)
+
+    # start heartbeat thread once when worker starts
+    def _start_heartbeat_thread(self) -> None:
+        """
+        Start the background heartbeat thread.
+        """
+        if self.tracking is None:
+            return
+
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            return
+
+        self._heartbeat_stop_event.clear()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name=f"{self.worker_id}-heartbeat",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    # stop heartbeat thread during worker shutdown
+    def _stop_heartbeat_thread(self) -> None:
+        """
+        Stop the background heartbeat thread.
+        """
+        self._heartbeat_stop_event.set()
+
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=self.heartbeat_interval + 1)
+            self._heartbeat_thread = None
 
     # set active task record
     def _set_active_task(
@@ -124,9 +132,6 @@ class Worker:
         max_retries: int,
         started_at: float,
     ) -> None:
-        """
-        Store the current active task for this worker slot if tracking is enabled.
-        """
         if self.tracking is None:
             return
 
@@ -142,28 +147,18 @@ class Worker:
 
         self.tracking.set_active(record)
 
-    # clear active task record
     def _clear_active_task(self) -> None:
-        """
-        Clear the current active task for this worker slot if tracking is enabled.
-        """
         if self.tracking is None:
             return
 
         self.tracking.clear_active(self.worker_id, self.slot)
 
-    # build DLQ message for normal failures
     def _build_dead_letter_message(
         self,
         message: TaskMessage,
         dead_letter_reason: str,
         failure_type: str,
     ) -> DLQMessage:
-        """
-        Build a DLQ message from a task message.
-
-        This is used when a task should no longer be retried automatically.
-        """
         return {
             "id": message["id"],
             "task_name": message["task_name"],
@@ -180,63 +175,51 @@ class Worker:
         }
 
     def start(self) -> None:
-        """
-        Start the worker main loop.
-
-        The worker keeps running until stop() is called
-        or a KeyboardInterrupt is received.
-        """
         self.running = True
         self._log(
             f"worker_started worker_id={self.worker_id} "
             f"queue={self.queue} poll_timeout={self.poll_timeout} "
-            f"visibility_timeout={self.visibility_timeout} slot={self.slot}"  # CHANGED
+            f"visibility_timeout={self.visibility_timeout} slot={self.slot}"
         )
 
-        while self.running:
-            try:
-                self.broker.requeue_stale_tasks(
-                    queue=self.queue,
-                    visibility_timeout=self.visibility_timeout,
-                )
+        # start background heartbeat thread before entering main loop
+        self._start_heartbeat_thread()
 
-                reserved = self.broker.reserve(
-                    queue=self.queue,
-                    timeout=self.poll_timeout,
-                )
+        try:
+            while self.running:
+                try:
+                    reserved = self.broker.reserve(
+                        queue=self.queue,
+                        timeout=self.poll_timeout,
+                    )
 
-                if reserved is None:
-                    continue
+                    if reserved is None:
+                        continue
 
-                raw_message, message = reserved
-                self._handle_task(raw_message, message)
+                    raw_message, message = reserved
+                    self._handle_task(raw_message, message)
 
-            except KeyboardInterrupt:
-                self._log(f"worker_stopped worker_id={self.worker_id}")
-                self.running = False
-            except Exception as exc:
-                self._log(
-                    f"worker_loop_error worker_id={self.worker_id} "
-                    f"error_type={type(exc).__name__} error={exc}"
-                )
+                except KeyboardInterrupt:
+                    self._log(f"worker_stopped worker_id={self.worker_id}")
+                    self.running = False
+                except Exception as exc:
+                    self._log(
+                        f"worker_loop_error worker_id={self.worker_id} "
+                        f"error_type={type(exc).__name__} error={exc}"
+                    )
+        finally:
+            # stop heartbeat thread before clearing heartbeat
+            self._stop_heartbeat_thread()
+
+            # clear heartbeat on exit
+            if self.tracking is not None:
+                self.tracking.clear_heartbeat(self.worker_id, self.slot)
 
     def stop(self) -> None:
-        """
-        Stop the worker loop gracefully.
-        """
         self.running = False
         self._log(f"worker_stop_requested worker_id={self.worker_id}")
 
     def _handle_task(self, raw_message: str, message: TaskMessage) -> None:
-        """
-        Execute one reserved task.
-
-        The message is already in the processing queue at this point.
-        This method must eventually do one of the following:
-            - ack the task after final success
-            - requeue the task for retry
-            - dead-letter the task and ack it
-        """
         task_id = message["id"]
         task_name = message["task_name"]
         attempt = message["attempt"]
@@ -266,13 +249,19 @@ class Worker:
             max_retries=max_retries,
         )
 
-        # record active task before function execution
         self._set_active_task(
             task_id=task_id,
             task_name=task_name,
             attempt=attempt,
             max_retries=max_retries,
             started_at=started_at,
+        )
+
+        self._log(
+            f"task_started worker_id={self.worker_id} "
+            f"slot={self.slot} pid={os.getpid()} "
+            f"task_id={task_id} task_name={task_name} "
+            f"attempt={attempt} max_retries={max_retries}"
         )
 
         try:
@@ -288,7 +277,6 @@ class Worker:
 
             self.broker.ack(self.queue, raw_message)
 
-            # add success log
             self._log(
                 f"task_success worker_id={self.worker_id} "
                 f"task_id={task_id} task_name={task_name} "
@@ -335,7 +323,6 @@ class Worker:
                     updated_message=updated_message,
                 )
             else:
-                # dead-letter the task instead of marking plain failure
                 dlq_message = self._build_dead_letter_message(
                     message=message,
                     dead_letter_reason="max_tries_exceeded",
@@ -362,5 +349,4 @@ class Worker:
                     f"error={error_message}"
                 )
         finally:
-            # always clear active task record
             self._clear_active_task()

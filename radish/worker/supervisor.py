@@ -30,8 +30,8 @@ class WorkerSupervisor:
         project_name: str,
         run_id: str,
         monitor_interval: float = 1.0,
-        restart_window_seconds: int = 300, #300
-        max_crashes_in_window: int = 3,
+        restart_window_seconds: int = 300,
+        max_crashes_in_window: int = 2,
         worker_tracking_redis_url: Optional[str] = None,
     ) -> None:
         self.app_path = app_path
@@ -43,7 +43,7 @@ class WorkerSupervisor:
         self.run_id = run_id
         self.monitor_interval = monitor_interval
 
-        # crash loop protection config
+        # Task crash protection config
         self.restart_window_seconds = restart_window_seconds
         self.max_crashes_in_window = max_crashes_in_window
 
@@ -51,25 +51,25 @@ class WorkerSupervisor:
         self.shutting_down = False
         self.workers: Dict[int, WorkerSlot] = {}
 
-        # track recent crash timestamps by slot
-        self.crash_history: Dict[int, List[float]] = {}
-        self.disabled_slots: set[int] = set()
+        # Track recent crash timestamps by task_id
+        self.crash_history: Dict[str, List[float]] = {}
 
         self.logger = create_supervisor_logger(
             project_name=self.project_name,
             run_id=self.run_id,
         )
 
-        # load app in supervisor for broker/backend access
+        # Load app in supervisor for broker/backend access
         self.app = load_app(self.app_path)
 
-        # infer worker tracking redis url if not provided
+        # Infer worker tracking Redis URL if not provided
         self.worker_tracking_redis_url = (
             worker_tracking_redis_url or self._infer_redis_url_from_broker()
         )
 
-        # create worker tracking client for supervisor side lookup
+        # Create worker tracking client for supervisor side lookup
         self.tracking = RedisWorkerTracking(self.worker_tracking_redis_url)
+        self.heartbeat_timeout = 10
 
     def _log(self, event: str) -> None:
         self.logger.info(event)
@@ -77,7 +77,7 @@ class WorkerSupervisor:
     def _build_worker_id(self, slot_id: int) -> str:
         return f"worker-{slot_id}"
 
-    # infer redis url from app broker connection settings
+    # Infer Redis URL from app broker connection settings
     def _infer_redis_url_from_broker(self) -> str:
         """
         Build a Redis URL from the broker client's connection settings.
@@ -103,30 +103,30 @@ class WorkerSupervisor:
 
         return f"redis://{auth_part}{host}:{port}/{db}"
 
-    # keep only crash timestamps within the configured window
-    def _prune_crash_history(self, slot_id: int, now: float) -> None:
-        history = self.crash_history.get(slot_id, [])
-        self.crash_history[slot_id] = [
+    # Keep only crash timestamps within the configured window
+    def _prune_crash_history(self, task_id: str, now: float) -> None:
+        history = self.crash_history.get(task_id, [])
+        self.crash_history[task_id] = [
             ts for ts in history if now - ts <= self.restart_window_seconds
         ]
 
-    # record one crash event and return current crash count in window
-    def _record_crash(self, slot_id: int) -> int:
+    # Record one crash event for a task and return current crash count in window
+    def _record_crash(self, task_id: str) -> int:
         now = time.time()
-        self._prune_crash_history(slot_id, now)
+        self._prune_crash_history(task_id, now)
 
-        history = self.crash_history.get(slot_id, [])
+        history = self.crash_history.get(task_id, [])
         history.append(now)
-        self.crash_history[slot_id] = history
+        self.crash_history[task_id] = history
 
         return len(history)
 
-    # determine whether a slot has entered crash loop
-    def _is_crash_loop(self, slot_id: int) -> bool:
-        history = self.crash_history.get(slot_id, [])
+    # Determine whether a task has entered crash loop
+    def _is_crash_loop(self, task_id: str) -> bool:
+        history = self.crash_history.get(task_id, [])
         return len(history) >= self.max_crashes_in_window
 
-    # find the currently reserved task message in processing queue by task_id
+    # Find the currently reserved task message in processing queue by task_id
     def _find_processing_message(self, task_id: str) -> Optional[Tuple[str, TaskMessage]]:
         processing_key = self.app.broker._processing_key(self.queue)
         raw_messages = self.app.broker.redis.lrange(processing_key, 0, -1)
@@ -138,7 +138,7 @@ class WorkerSupervisor:
 
         return None
 
-    # build DLQ message for worker crash loop
+    # Build DLQ message for task crash loop
     def _build_dead_letter_message(self, message: TaskMessage) -> DLQMessage:
         return {
             "id": message["id"],
@@ -150,12 +150,12 @@ class WorkerSupervisor:
             "attempt": message["attempt"],
             "max_retries": message["max_retries"],
             "retry_delay_ms": message["retry_delay_ms"],
-            "dead_letter_reason": "worker_crash_loop",
+            "dead_letter_reason": "task_crash_loop",
             "failure_type": "worker_crash",
             "dead_lettered_at": time.time(),
         }
 
-    # move the active task to DLQ when a slot enters crash loop
+    # Move the active task to DLQ when the task enters crash loop
     def _dead_letter_active_task_for_crash_loop(
         self,
         slot_id: int,
@@ -165,7 +165,7 @@ class WorkerSupervisor:
         active_record = self.tracking.get_active(worker_id, slot_id)
         if active_record is None:
             self._log(
-                f"worker_crash_loop_no_active_task slot={slot_id} "
+                f"task_crash_loop_no_active_task slot={slot_id} "
                 f"worker_id={worker_id} exitcode={exitcode}"
             )
             return
@@ -173,11 +173,12 @@ class WorkerSupervisor:
         found = self._find_processing_message(active_record.task_id)
         if found is None:
             self._log(
-                f"worker_crash_loop_processing_message_missing slot={slot_id} "
+                f"task_crash_loop_processing_message_missing slot={slot_id} "
                 f"worker_id={worker_id} task_id={active_record.task_id} "
                 f"exitcode={exitcode}"
             )
             self.tracking.clear_active(worker_id, slot_id)
+            self.tracking.clear_heartbeat(worker_id, slot_id)
             return
 
         raw_message, message = found
@@ -189,16 +190,63 @@ class WorkerSupervisor:
             attempt=message["attempt"],
             max_retries=message["max_retries"],
             error=f"worker exited unexpectedly with exitcode={exitcode}",
-            dead_letter_reason="worker_crash_loop",
+            dead_letter_reason="task_crash_loop",
             started_at=active_record.started_at,
         )
         self.app.broker.ack(self.queue, raw_message)
         self.tracking.clear_active(worker_id, slot_id)
+        self.tracking.clear_heartbeat(worker_id, slot_id)
 
         self._log(
-            f"task_dead_lettered_for_worker_crash_loop slot={slot_id} "
+            f"task_dead_lettered_for_task_crash_loop slot={slot_id} "
             f"worker_id={worker_id} task_id={message['id']} "
             f"task_name={message['task_name']} exitcode={exitcode}"
+        )
+
+    # Requeue active task immediately when worker process exits
+    def _requeue_active_task_for_worker_exit(
+        self,
+        slot_id: int,
+        worker_id: str,
+        exitcode: int,
+    ) -> None:
+        active_record = self.tracking.get_active(worker_id, slot_id)
+
+        if active_record is None:
+            self._log(
+                f"worker_exit_no_active slot={slot_id} "
+                f"worker_id={worker_id} exitcode={exitcode}"
+            )
+            return
+
+        found = self._find_processing_message(active_record.task_id)
+
+        if found is None:
+            self._log(
+                f"worker_exit_processing_missing slot={slot_id} "
+                f"worker_id={worker_id} task_id={active_record.task_id} "
+                f"exitcode={exitcode}"
+            )
+            self.tracking.clear_active(worker_id, slot_id)
+            self.tracking.clear_heartbeat(worker_id, slot_id)
+            return
+
+        raw_message, message = found
+
+        # Requeue immediately
+        self.app.broker.requeue(
+            queue=self.queue,
+            raw_message=raw_message,
+            updated_message=message,
+        )
+
+        self.tracking.clear_active(worker_id, slot_id)
+        self.tracking.clear_heartbeat(worker_id, slot_id)
+
+        self._log(
+            f"task_requeued_due_to_worker_exit slot={slot_id} "
+            f"worker_id={worker_id} task_id={message['id']} "
+            f"exitcode={exitcode}"
         )
 
     def _spawn_worker(self, slot_id: int) -> WorkerSlot:
@@ -236,17 +284,10 @@ class WorkerSupervisor:
 
     def _start_initial_workers(self) -> None:
         for slot_id in range(1, self.worker_count + 1):
-            if slot_id in self.disabled_slots:
-                continue
             slot = self._spawn_worker(slot_id)
             self.workers[slot_id] = slot
 
     def _restart_worker(self, slot_id: int) -> None:
-        # do not restart disabled slots
-        if slot_id in self.disabled_slots:
-            self._log(f"worker_restart_skipped slot={slot_id} reason=slot_disabled")
-            return
-
         old_slot = self.workers.get(slot_id)
 
         if old_slot:
@@ -287,12 +328,24 @@ class WorkerSupervisor:
             f"worker_id={slot.worker_id} pid={process.pid} exitcode={exitcode}"
         )
 
-        # record crash and evaluate crash loop protection
-        crash_count = self._record_crash(slot_id)
-        if self._is_crash_loop(slot_id):
+        active_record = self.tracking.get_active(slot.worker_id, slot_id)
+
+        # No active task means there is nothing to DLQ or requeue
+        if active_record is None:
             self._log(
-                f"worker_crash_loop_detected slot={slot_id} "
-                f"worker_id={slot.worker_id} crash_count={crash_count} "
+                f"worker_crash_no_active_task slot={slot_id} "
+                f"worker_id={slot.worker_id} exitcode={exitcode}"
+            )
+            self.tracking.clear_heartbeat(slot.worker_id, slot_id)
+            self._restart_worker(slot_id)
+            return
+
+        crash_count = self._record_crash(active_record.task_id)
+        if self._is_crash_loop(active_record.task_id):
+            self._log(
+                f"task_crash_loop_detected slot={slot_id} "
+                f"worker_id={slot.worker_id} task_id={active_record.task_id} "
+                f"crash_count={crash_count} "
                 f"window_seconds={self.restart_window_seconds}"
             )
 
@@ -301,21 +354,19 @@ class WorkerSupervisor:
                 worker_id=slot.worker_id,
                 exitcode=exitcode,
             )
-
-            self.disabled_slots.add(slot_id)
-            self.workers.pop(slot_id, None)
-            self._log(
-                f"worker_slot_disabled slot={slot_id} "
-                f"worker_id={slot.worker_id} reason=worker_crash_loop"
-            )
+            self._restart_worker(slot_id)
             return
+
+        self._requeue_active_task_for_worker_exit(
+            slot_id=slot_id,
+            worker_id=slot.worker_id,
+            exitcode=exitcode,
+        )
 
         self._restart_worker(slot_id)
 
     def _check_workers(self) -> None:
         for slot_id, slot in list(self.workers.items()):
-            if slot_id in self.disabled_slots:
-                continue
             process = slot.process
 
             if process.is_alive():
@@ -347,6 +398,73 @@ class WorkerSupervisor:
         self._log(f"signal_received signal={signum}")
         self.running = False
 
+    def _is_heartbeat_expired(self, last_heartbeat_at: float) -> bool:
+        """
+        Check whether heartbeat is expired.
+        """
+        return (time.time() - last_heartbeat_at) > self.heartbeat_timeout
+
+    def _handle_offline_worker(self, worker_id: str, slot_id: int) -> None:
+        """
+        Handle worker that missed heartbeat.
+        """
+        active_record = self.tracking.get_active(worker_id, slot_id)
+
+        if active_record is None:
+            # No active task, just clear heartbeat
+            self.tracking.clear_heartbeat(worker_id, slot_id)
+            self._log(
+                f"worker_offline_no_active slot={slot_id} worker_id={worker_id}"
+            )
+            return
+
+        found = self._find_processing_message(active_record.task_id)
+
+        if found is None:
+            self._log(
+                f"worker_offline_processing_missing slot={slot_id} "
+                f"worker_id={worker_id} task_id={active_record.task_id}"
+            )
+            self.tracking.clear_active(worker_id, slot_id)
+            self.tracking.clear_heartbeat(worker_id, slot_id)
+            return
+
+        raw_message, message = found
+
+        # Requeue the task
+        self.app.broker.requeue(
+            queue=self.queue,
+            raw_message=raw_message,
+            updated_message=message,
+        )
+
+        self.tracking.clear_active(worker_id, slot_id)
+        self.tracking.clear_heartbeat(worker_id, slot_id)
+
+        self._log(
+            f"task_requeued_due_to_worker_offline slot={slot_id} "
+            f"worker_id={worker_id} task_id={message['id']}"
+        )
+
+    def _check_worker_heartbeats(self) -> None:
+        """
+        Scan all heartbeats and detect offline workers.
+        """
+        heartbeats = self.tracking.list_all_heartbeats()
+
+        for hb in heartbeats:
+            # Process state takes precedence over heartbeat state
+            slot = self.workers.get(hb.slot)
+            if slot is not None and slot.process.is_alive():
+                continue
+
+            if self._is_heartbeat_expired(hb.last_heartbeat_at):
+                self._log(
+                    f"worker_heartbeat_expired slot={hb.slot} "
+                    f"worker_id={hb.worker_id}"
+                )
+                self._handle_offline_worker(hb.worker_id, hb.slot)
+
     def start(self) -> None:
         self.running = True
 
@@ -358,7 +476,7 @@ class WorkerSupervisor:
             f"supervisor_started app={self.app_path} "
             f"queue={self.queue} workers={self.worker_count} "
             f"restart_window_seconds={self.restart_window_seconds} "
-            f"max_crashes_in_window={self.max_crashes_in_window}"  # CHANGED
+            f"max_crashes_in_window={self.max_crashes_in_window}"
         )
 
         self._start_initial_workers()
@@ -366,7 +484,12 @@ class WorkerSupervisor:
         try:
             while self.running:
                 self._check_workers()
+
+                # Add heartbeat check
+                self._check_worker_heartbeats()
+
                 time.sleep(self.monitor_interval)
+
         except KeyboardInterrupt:
             self._log("keyboard_interrupt")
             self.running = False
