@@ -46,9 +46,8 @@ class RedisReader:
 
     def get_all_active_tasks(self) -> list[dict[str, Any]]:
         patterns = [
-            "radish:worker:*:active_task",
-            "radish:workers:*:active_task",
-            "radish:worker:*:active",
+            "radish:worker:active:*",
+            "radish:worker:active_task:*",
             "radish:active_task:*",
         ]
         return self._read_records_from_patterns(self.broker_redis, patterns)

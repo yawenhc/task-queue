@@ -33,6 +33,8 @@ class WorkerSupervisor:
         restart_window_seconds: int = 300,
         max_crashes_in_window: int = 2,
         worker_tracking_redis_url: Optional[str] = None,
+        heartbeat_timeout: int = 10,
+        heartbeat_interval: int = 2,
     ) -> None:
         self.app_path = app_path
         self.queue = queue
@@ -69,7 +71,8 @@ class WorkerSupervisor:
 
         # Create worker tracking client for supervisor side lookup
         self.tracking = RedisWorkerTracking(self.worker_tracking_redis_url)
-        self.heartbeat_timeout = 10
+        self.heartbeat_timeout = heartbeat_timeout
+        self.heartbeat_interval = heartbeat_interval
 
     def _log(self, event: str) -> None:
         self.logger.info(event)
@@ -264,6 +267,7 @@ class WorkerSupervisor:
                 "run_id": self.run_id,
                 "slot": slot_id,
                 "worker_tracking_redis_url": self.worker_tracking_redis_url,
+                "heartbeat_interval": self.heartbeat_interval,
             },
             name=worker_id,
         )

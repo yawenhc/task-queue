@@ -15,7 +15,7 @@
                 <th>Queue</th>
                 <th>Started At</th>
                 <th>Last Heartbeat</th>
-                <th>Seconds Since Heartbeat</th>
+<!--                <th>Seconds Since Heartbeat</th>-->
             </tr>
         </thead>
         <tbody>
@@ -29,7 +29,7 @@
                 <td>{{ worker.queue or "-" }}</td>
                 <td>{{ worker.started_at or "-" }}</td>
                 <td>{{ worker.last_heartbeat_at or "-" }}</td>
-                <td>{{ worker.seconds_since_heartbeat if worker.seconds_since_heartbeat is not none else "-" }}</td>
+<!--                <td>{{ worker.seconds_since_heartbeat if worker.seconds_since_heartbeat is not none else "-" }}</td>-->
             </tr>
             {% endfor %}
         </tbody>

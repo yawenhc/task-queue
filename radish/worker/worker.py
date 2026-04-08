@@ -30,6 +30,7 @@ class Worker:
         logger: Optional[logging.Logger] = None,
         tracking: Optional[WorkerTracking] = None,
         slot: int = 0,
+        heartbeat_interval: int = 2,
     ):
         self.broker = broker
         self.backend = backend
@@ -44,7 +45,7 @@ class Worker:
         self.slot = slot
 
         # heartbeat interval is fixed for now
-        self.heartbeat_interval = 2
+        self.heartbeat_interval = heartbeat_interval
 
         # background heartbeat thread state
         self._heartbeat_thread: Optional[threading.Thread] = None

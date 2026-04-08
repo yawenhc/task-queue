@@ -40,6 +40,7 @@ def run_worker_process(
     run_id: str,
     slot: int = 0,
     worker_tracking_redis_url: Optional[str] = None,
+    heartbeat_interval: int = 2,
 ) -> None:
     """
     Entry point for a worker child process.
@@ -87,6 +88,7 @@ def run_worker_process(
             logger=logger,
             tracking=tracking,
             slot=slot,
+            heartbeat_interval =heartbeat_interval,
         )
 
         logger.info(
