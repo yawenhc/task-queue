@@ -6,7 +6,7 @@ from radish.backend.redis_backend import RedisBackend
 from radish.broker.redis_broker import RedisBroker
 from radish.result import AsyncResult
 from radish.task import Task
-from radish.models import TaskMessage
+from radish.models import TaskMessage, ResultMessage, TaskState
 
 
 class Radish:
@@ -66,7 +66,7 @@ class Radish:
         self,
         name: Optional[str] = None,
         queue: Optional[str] = None,
-        max_retries: int = 1,
+        max_retries: int = 2,
         retry_delay_ms: int = 0,
     ) -> Callable[[Callable[..., Any]], Task]:
         """
@@ -125,7 +125,7 @@ class Radish:
         args: tuple[Any, ...] = (),
         kwargs: Optional[dict[str, Any]] = None,
         queue: Optional[str] = None,
-        max_retries: int = 1,
+        max_retries: int = 2,
         retry_delay_ms: int = 0,
     ) -> AsyncResult:
         """
@@ -203,3 +203,33 @@ class Radish:
             Task or None
         """
         return self.registry.get(task_name)
+
+    def get_async_result(self, task_id: str) -> AsyncResult:
+        """
+        Create an AsyncResult handle for an existing task id.
+
+        This is useful when the caller already has a task_id and wants
+        to query the task state or result later.
+        """
+        return AsyncResult(task_id=task_id, backend=self.backend)
+
+    def get_result(self, task_id: str) -> Optional[ResultMessage]:
+        """
+        Fetch the raw result record for a task from the backend.
+
+        Returns:
+            ResultMessage or None
+        """
+        return self.backend.get_result(task_id)
+
+    def get_task_state(self, task_id: str) -> Optional[TaskState]:
+        """
+        Fetch only the current task state from the backend.
+
+        Returns:
+            TaskState or None if the task result does not exist.
+        """
+        result = self.backend.get_result(task_id)
+        if result is None:
+            return None
+        return result["state"]
