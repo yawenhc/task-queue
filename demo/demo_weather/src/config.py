@@ -2,7 +2,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
-CITIES_FILE = DATA_DIR / "long_cities.json"
+CITIES_FILE = DATA_DIR / "cities.json"
 
 GEOCODING_BASE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_BASE_URL = "https://api.open-meteo.com/v1/forecast"

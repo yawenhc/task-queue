@@ -25,6 +25,7 @@ def main() -> None:
         async_result = app.send_task(
             "fetch_weather_for_city",
             args=(city,),
+            max_retries=2,#2
         )
         async_results.append(async_result)
         task_ids.append(async_result.task_id)

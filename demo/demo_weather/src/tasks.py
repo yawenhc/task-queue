@@ -43,7 +43,7 @@ def build_record(city: str) -> dict:
 @app.task(
     name="fetch_weather_for_city",
     queue=QUEUE_NAME,
-    max_retries=2,
+    max_retries=2,#2
     retry_delay_ms=1000,
 )
 def fetch_weather_for_city(city: str) -> dict:
